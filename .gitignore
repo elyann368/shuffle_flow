@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+**/*.rs.bk
+*.dmg
+/*.app/
+/Shuffle-*.zip
+.agents/
+.claude/
+skills-lock.json

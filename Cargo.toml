@@ -1,0 +1,43 @@
+[package]
+name = "shuffle"
+version = "0.4.0"
+edition = "2021"
+description = "Shuffle Flow — a Chinese/English macOS file manager based on Shuffle"
+license = "MIT"
+repository = "https://github.com/elyann368/shuffle_flow"
+publish = false
+
+[dependencies]
+gpui = "0.2.2"
+chrono = "0.4"
+# Parallel fuzzy scoring of the in-memory file index.
+rayon = "1"
+# Fast parallel directory walking for index builds.
+jwalk = "0.8"
+# Decode the TIFF that NSImage hands us for file-type icons.
+image = { version = "0.25", features = ["tiff"] }
+# Fetch real macOS file icons via NSWorkspace (Apple Silicon / AppKit).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileManager", "NSURL", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSSharingService"] }
+# Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
+raw-window-handle = "0.6"
+
+# Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
+# both Apple Silicon and Intel Macs. Build with a thin release profile while
+# we iterate; we can tune this later.
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[features]
+# This repository builds Shuffle Flow and keeps its local modifications by default.
+default = ["runtime-shaders", "local-build"]
+# Compile Metal shaders at launch when the standalone Metal compiler is absent.
+runtime-shaders = ["gpui/runtime_shaders"]
+# Personal builds retain local changes instead of installing upstream releases.
+local-build = []
