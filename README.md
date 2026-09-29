@@ -18,6 +18,7 @@ Based on **[Shuffle by WizenPainter / Jaime Guzman](https://github.com/WizenPain
 | Quick Look | Uses the native macOS panel. A single selection browses the displayed directory order; multiple selections browse only the chosen items. Up/Down navigate, Left/Right use native panel navigation, Space/Esc close, and browser focus follows. |
 | Performance | Lightweight mode is on by default: no home-directory fuzzy index at launch. Bounded shared preview caches and limited background generation reduce accumulated memory during browsing. |
 | Optional servers | SSH/SFTP is off by default, with a settings toggle. Disabling it blocks new connections and launch reconnection while preserving saved servers and credentials. |
+| Paths and terminal | ⌘⇧T opens Terminal in the browsing directory; ⌘⇧D copies full paths; ⌘⇧F copies enclosing folder paths. Supports multiple selections, deduplicated parents, current-directory fallback, and configurable bindings. |
 | Branding and updates | The packaged app and native app menu use **Shuffle Flow**. Local builds have separate preferences and disable the upstream binary updater to retain these changes. |
 
 Inherited from Shuffle: tabs, split panes, a command palette, previews, themes, and cloud/server browsing. These are upstream features; this change set does not reimplement or fully revalidate all of them.
@@ -81,17 +82,25 @@ See [PERFORMANCE.md](PERFORMANCE.md) for measurement conditions and results.
 | Extract selected archive | ⌥⌘E (added by this fork) |
 | Undo file operation | ⌘Z |
 | Get Info | ⌘I |
+| Open Terminal in current folder | ⌘⇧T |
+| Copy full path (Dir) | ⌘⇧D |
+| Copy enclosing folder path (Folder) | ⌘⇧F |
 | Open/close Quick Look | Space (Esc also closes) |
 | Navigate Quick Look items | ↑/↓/←/→ |
 | Settings | ⌘, |
 
 Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleared bindings remain cleared; use **Reset Keybinds to Default** if needed. While editing a name, ⌘C/⌘V operate on text. With a composing input method, confirm the candidate before confirming the rename.
 
+D keeps the final item name; F removes it. For `/data/project/report.pdf`, D copies the full path and F copies `/data/project`. For a selected folder `/data/project`, D copies that folder and F copies `/data`. Multiple selections are sorted by path, one per line; F deduplicates parent directories. Without a selection, both copy the browsing directory. T uses the active pane's browsing directory, or the active column in Column view, regardless of selected folders. This version opens the system Terminal for local directories only; remote tabs can copy remote paths.
+
+Saved custom bindings and explicit clears are preserved; new defaults do not take over saved bindings. If an older configuration has Copy Path unbound, assign ⌘⇧D individually. Resetting defaults also resets other custom bindings. Reassigning an occupied combination in Settings clears the previous action within the same input context.
+
 ## Core source layout
 
 | File | Role |
 | --- | --- |
 | `src/main.rs` | File browser, file operations, shortcuts, native menus, and settings inherited from upstream and modified here. |
+| `src/path_actions.rs` | Full/parent path handling, active-column directory selection, and literal terminal arguments. |
 | `src/i18n.rs` | UI translation catalog and persisted language selection. |
 | `src/ime.rs` | Inline rename's native text-input handler and Unicode/composition range conversion. |
 | `src/quicklook.rs` | Native Quick Look controller, navigation, and browser focus synchronization. |
@@ -105,7 +114,7 @@ Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleare
 
 Before this sync, both the local-build and upstream-compatible configurations passed **17 tests** covering composition/range handling, Unicode Finder file URLs, Chinese filenames, copy/move conflicts, archive extraction, shortcuts, and menu placement. The release build and bundle signature checks passed.
 
-The current version passes all **24 tests** with `cargo test --locked` and the default Shuffle Flow features. New coverage includes preview navigation boundaries, cache retention/eviction and immediate budget reduction, ranking equivalence, legacy preference migration, and saved performance/SSH settings.
+The current version passes all **27 tests** with `cargo test --locked` and the default Shuffle Flow features. New coverage includes preview navigation boundaries, cache retention/eviction and immediate budget reduction, ranking equivalence, legacy preference migration, and saved performance/SSH settings. Path coverage includes Chinese/emoji names, deduplicated parents, root/empty-selection behavior, active-column paths, literal terminal arguments, and binding migration/conflicts.
 
 Actual-window checks confirmed the Shuffle Flow menu name, left-opening/bottom-clamped tag submenu without moving the root, ⇧⌘N folder creation, and saving a pasted Chinese/emoji folder name. Native Quick Look was also checked across three Chinese-named text files: Down/Right/Up navigation, updated content, and Space to close. Column-view navigation was checked inside a child directory too. Native panel presentation is deferred outside GPUI updates to avoid reentrant App borrows while preview generators load. The performance/SSH controls were checked in the actual settings window, including persistence after restart. Pinyin candidate-window interaction has not yet been manually verified.
 
@@ -122,3 +131,5 @@ These items are plans, not completed features. Bug reports are welcome through [
 ## License
 
 [MIT](LICENSE). Original work © 2026 **Jaime Guzman**; Shuffle Flow modifications © 2026 **elyann368**. See [ATTRIBUTION.md](ATTRIBUTION.md) for the upstream baseline and asset/dependency credits.
+
+The new D/F shortcuts were checked in the actual window with a Chinese/emoji filename, including pasting the resulting text into the address bar; the right-click hints were also verified. Terminal command construction is tested, but its opened working directory has not been manually verified because the UI automation tool blocks access to Terminal.

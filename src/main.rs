@@ -11,6 +11,7 @@
 mod i18n;
 mod ime;
 mod menu_layout;
+mod path_actions;
 mod quicklook;
 mod memory;
 use i18n::{tr, Language};
@@ -786,6 +787,8 @@ enum KeyAction {
     Extract,
     Rename,
     CopyPath,
+    CopyFolderPath,
+    OpenTerminal,
     Duplicate,
     MakeAlias,
     Compress,
@@ -823,6 +826,8 @@ impl KeyAction {
         KeyAction::Extract,
         KeyAction::Rename,
         KeyAction::CopyPath,
+        KeyAction::CopyFolderPath,
+        KeyAction::OpenTerminal,
         KeyAction::Duplicate,
         KeyAction::MakeAlias,
         KeyAction::Compress,
@@ -877,6 +882,8 @@ impl KeyAction {
             KeyAction::NewFolder => "new_folder",
             KeyAction::Rename => "rename",
             KeyAction::CopyPath => "copy_path",
+            KeyAction::CopyFolderPath => "copy_folder_path",
+            KeyAction::OpenTerminal => "open_terminal",
             KeyAction::Duplicate => "duplicate",
             KeyAction::MakeAlias => "make_alias",
             KeyAction::Compress => "compress",
@@ -913,7 +920,9 @@ impl KeyAction {
             KeyAction::Extract => "Extract Here",
             KeyAction::NewFolder => "New folder",
             KeyAction::Rename => "Rename",
-            KeyAction::CopyPath => "Copy path",
+            KeyAction::CopyPath => "Copy Full Path",
+            KeyAction::CopyFolderPath => "Copy Enclosing Folder Path",
+            KeyAction::OpenTerminal => "Open Terminal in Current Folder",
             KeyAction::Duplicate => "Duplicate",
             KeyAction::MakeAlias => "Make alias",
             KeyAction::Compress => "Compress",
@@ -940,6 +949,9 @@ impl KeyAction {
         match self {
             KeyAction::CommandPalette => Some("cmd-p"),
             KeyAction::Copy => Some("cmd-c"),
+            KeyAction::CopyPath => Some("cmd-shift-d"),
+            KeyAction::CopyFolderPath => Some("cmd-shift-f"),
+            KeyAction::OpenTerminal => Some("cmd-shift-t"),
             KeyAction::Paste => Some("cmd-v"),
             KeyAction::MoveHere => Some("cmd-alt-v"),
             KeyAction::Extract => Some("cmd-alt-e"),
@@ -988,6 +1000,18 @@ impl Keymap {
     }
     fn set(&mut self, a: KeyAction, b: Option<String>) {
         self.binds[a.id()] = b;
+    }
+    /// Binding a shortcut explicitly transfers it within the same input scope.
+    fn bind_unique(&mut self, action: KeyAction, binding: String) {
+        for other in KeyAction::ALL.iter().copied() {
+            if other != action
+                && other.is_palette() == action.is_palette()
+                && self.get(other) == Some(binding.as_str())
+            {
+                self.set(other, None);
+            }
+        }
+        self.set(action, Some(binding));
     }
     /// The action bound to keystroke `ks`, if any.
     fn action_for(&self, ks: &str) -> Option<KeyAction> {
@@ -1358,7 +1382,7 @@ impl Settings {
             "cmd" | "ctrl" | "alt" | "shift" | "function" => return,
             _ => {
                 let mut km = keymap();
-                km.set(action, Some(canon_keystroke(ks)));
+                km.bind_unique(action, canon_keystroke(ks));
                 apply_keymap(km, cx);
             }
         }
@@ -2199,7 +2223,7 @@ impl Settings {
                 "Click a shortcut, then press the keys. \u{232b} clears it; Esc cancels.",
             )
             .into_any_element(),
-            settings_section("Shortcuts", None, rows),
+            settings_section("Shortcuts", Some("Assigning an occupied shortcut clears its previous action in the same input context."), rows),
             div()
                 .pt_1()
                 .child(reset_button(
@@ -3455,6 +3479,26 @@ fn mi_hint(
         }
         other => other,
     }
+}
+
+fn mi_shortcut(
+    label: impl Into<String>,
+    action: KeyAction,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    // Menu hints are static in upstream; show these only for default bindings.
+    if keymap().get(action) == action.default_binding() {
+        let hint = match action {
+            KeyAction::CopyPath => Some("⌘⇧D"),
+            KeyAction::CopyFolderPath => Some("⌘⇧F"),
+            KeyAction::OpenTerminal => Some("⌘⇧T"),
+            _ => None,
+        };
+        if let Some(hint) = hint {
+            return mi_hint(label, hint, on);
+        }
+    }
+    mi(label, on)
 }
 
 fn mi_danger(
@@ -6714,15 +6758,10 @@ impl Shuffle {
                     copy_files_to_pasteboard(&ts);
                 }));
             }
-            {
+            for (folder_only, action, label) in [(false, KeyAction::CopyPath, "Copy Full Path"), (true, KeyAction::CopyFolderPath, "Copy Enclosing Folder Path")] {
                 let ts = targets.clone();
-                let label = tr(if many { "Copy Paths" } else { "Copy Path" });
-                nodes.push(mi(label, move |this, _, cx| {
-                    let text = ts
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                nodes.push(mi_shortcut(tr(label), action, move |this, _, cx| {
+                    let text = path_actions::clipboard_text(&ts, &this.shortcut_directory(pane), folder_only);
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                     this.close_context_menu(cx);
                 }));
@@ -6890,6 +6929,10 @@ impl Shuffle {
                 push_menu_sep(&mut nodes);
             }
         }
+        nodes.push(mi_shortcut(tr("Open Terminal in Current Folder"), KeyAction::OpenTerminal, move |this, _, cx| {
+            this.close_context_menu(cx);
+            this.open_shortcut_terminal(pane, cx);
+        }));
         nodes.push(mi(tr("New Folder"), move |this, window, cx| {
             this.close_context_menu(cx);
             this.new_folder(pane, window, cx);
@@ -8921,6 +8964,66 @@ impl Shuffle {
         v
     }
 
+    fn shortcut_directory(&self, pane: usize) -> PathBuf {
+        let tab = self.tab(pane);
+        path_actions::browsing_directory(
+            &tab.current_dir,
+            &tab.col_chain,
+            (tab.view == ViewMode::Columns).then_some(tab.col_active),
+        )
+    }
+
+    fn copy_shortcut_paths(&mut self, pane: usize, folder_only: bool, cx: &mut Context<Self>) {
+        // Ignore a stale anchor when clicking the background cleared selection.
+        let selected = self.tab(pane).selection.iter().cloned().collect::<Vec<_>>();
+        let text =
+            path_actions::clipboard_text(&selected, &self.shortcut_directory(pane), folder_only);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_notice(
+            tr(if folder_only {
+                "Folder path copied"
+            } else {
+                "Full path copied"
+            })
+            .to_string(),
+            cx,
+        );
+    }
+
+    fn open_shortcut_terminal(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            self.set_notice(
+                tr("Open Terminal is available for local folders only.").to_string(),
+                cx,
+            );
+            return;
+        }
+        let dir = self.shortcut_directory(pane);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let output = path_actions::terminal_command(&dir)
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                    }
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_notice(
+                        localized!("Could not open Terminal: {error}", "无法打开终端：{error}"),
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Run a bound key action against the active pane.
     fn run_key_action(&mut self, action: KeyAction, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane;
@@ -8967,11 +9070,9 @@ impl Shuffle {
                     self.begin_rename(pane, p, window, cx);
                 }
             }
-            KeyAction::CopyPath => {
-                if let Some(p) = anchor {
-                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
-                }
-            }
+            KeyAction::CopyPath => self.copy_shortcut_paths(pane, false, cx),
+            KeyAction::CopyFolderPath => self.copy_shortcut_paths(pane, true, cx),
+            KeyAction::OpenTerminal => self.open_shortcut_terminal(pane, cx),
             KeyAction::Duplicate => {
                 if let Some(p) = anchor {
                     self.duplicate_entry(pane, p, cx);
@@ -20022,23 +20123,50 @@ fn load_icon_pack() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// Load the keymap, starting from defaults and applying saved overrides.
-fn load_keymap() -> Keymap {
+/// Saved bindings (including explicit clears) take precedence over new defaults.
+fn parse_keymap(s: &str) -> Keymap {
     let mut k = Keymap::defaults();
-    if let Some(file) = config_file("keymap.txt") {
-        if let Ok(s) = fs::read_to_string(&file) {
-            for line in s.lines() {
-                let Some((name, val)) = line.split_once('=') else {
-                    continue;
-                };
-                if let Some(a) = KeyAction::ALL.iter().copied().find(|a| a.key() == name.trim()) {
-                    let v = val.trim();
-                    k.set(a, if v.is_empty() { None } else { Some(v.to_string()) });
-                }
+    let mut explicit = vec![false; KeyAction::ALL.len()];
+    for line in s.lines() {
+        let Some((name, val)) = line.split_once('=') else {
+            continue;
+        };
+        if let Some(a) = KeyAction::ALL
+            .iter()
+            .copied()
+            .find(|a| a.key() == name.trim())
+        {
+            let v = val.trim();
+            k.set(
+                a,
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                },
+            );
+            explicit[a.id()] = true;
+        }
+    }
+    for a in KeyAction::ALL.iter().copied().filter(|a| !explicit[a.id()]) {
+        if let Some(binding) = k.get(a).map(str::to_owned) {
+            if KeyAction::ALL.iter().copied().any(|other| {
+                explicit[other.id()]
+                    && other.is_palette() == a.is_palette()
+                    && k.get(other) == Some(binding.as_str())
+            }) {
+                k.set(a, None);
             }
         }
     }
     k
+}
+
+fn load_keymap() -> Keymap {
+    config_file("keymap.txt")
+        .and_then(|file| fs::read_to_string(file).ok())
+        .map(|s| parse_keymap(&s))
+        .unwrap_or_else(Keymap::defaults)
 }
 
 /// Missing fields retain safe defaults when upgrading an existing configuration.
@@ -20643,6 +20771,30 @@ mod tests {
         keymap.set(KeyAction::Copy, Some("ctrl-c".into()));
         assert!(keymap.action_for("cmd-c").is_none());
         assert!(keymap.action_for("ctrl-c") == Some(KeyAction::Copy));
+    }
+
+    #[test]
+    fn mnemonic_shortcuts_preserve_existing_bindings_and_scopes() {
+        let k = Keymap::defaults();
+        for (binding, action) in [
+            ("cmd-shift-t", KeyAction::OpenTerminal),
+            ("cmd-shift-d", KeyAction::CopyPath),
+            ("cmd-shift-f", KeyAction::CopyFolderPath),
+        ] {
+            assert!(k.action_for(binding) == Some(action));
+        }
+        let k = parse_keymap("copy_path=\nnew_tab=cmd-shift-t\ncommand_palette=cmd-shift-f\n");
+        assert!(k.get(KeyAction::CopyPath).is_none());
+        assert!(k.get(KeyAction::OpenTerminal).is_none());
+        assert!(k.get(KeyAction::CopyFolderPath).is_none());
+        assert!(k.action_for("cmd-shift-t") == Some(KeyAction::NewTab));
+        let mut k = Keymap::defaults();
+        k.bind_unique(KeyAction::OpenTerminal, "cmd-shift-d".into());
+        assert!(k.get(KeyAction::CopyPath).is_none());
+        assert!(k.action_for("cmd-shift-d") == Some(KeyAction::OpenTerminal));
+        k.bind_unique(KeyAction::CopyPath, "cmd-a".into());
+        assert!(k.get(KeyAction::SelectAll).is_none());
+        assert_eq!(k.get(KeyAction::PaletteSelectAll), Some("cmd-a"));
     }
 
     #[test]
