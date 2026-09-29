@@ -15,6 +15,9 @@ Based on **[Shuffle by WizenPainter / Jaime Guzman](https://github.com/WizenPain
 | Copy and move | Finder-style shortcuts and system file clipboard integration. Copy/paste supports multiple items and folders; moves do not overwrite existing destinations and report conflicts. |
 | Archive extraction | ZIP and TAR variants extract into a separate sibling folder. Destination names avoid collisions; errors are shown and successful extraction can be undone. Available from the context menu, archive double-click, and a shortcut. |
 | Tags menu | Root and submenu are measured separately. Opening a submenu keeps the root stationary; the submenu opens left when the right edge has insufficient space and avoids the bottom edge independently. This fixes the layout cycle that caused hover flicker. |
+| Quick Look | Uses the native macOS panel. A single selection browses the displayed directory order; multiple selections browse only the chosen items. Up/Down navigate, Left/Right use native panel navigation, Space/Esc close, and browser focus follows. |
+| Performance | Lightweight mode is on by default: no home-directory fuzzy index at launch. Bounded shared preview caches and limited background generation reduce accumulated memory during browsing. |
+| Optional servers | SSH/SFTP is off by default, with a settings toggle. Disabling it blocks new connections and launch reconnection while preserving saved servers and credentials. |
 | Branding and updates | The packaged app and native app menu use **Shuffle Flow**. Local builds have separate preferences and disable the upstream binary updater to retain these changes. |
 
 Inherited from Shuffle: tabs, split panes, a command palette, previews, themes, and cloud/server browsing. These are upstream features; this change set does not reimplement or fully revalidate all of them.
@@ -48,6 +51,20 @@ Settings: **Settings → General → Explorer → Language**. Application identi
 SHUFFLE_CONFIG_DIR=/tmp/shuffle-flow-config cargo run --locked
 ```
 
+## Performance and connection settings
+
+Open **Settings → General → Performance** (⌘,):
+
+- **Lightweight mode:** on by default, intended for 8 GB Macs. Global name/content search uses Spotlight without a resident home-directory index. Direct path browsing and current-folder filtering remain available. Results depend on Spotlight coverage; excluded or unindexed folders may not appear.
+- **Indexed search:** turn lightweight mode off to build a fuzzy index only when the command palette first opens. Estimated retained index data is limited to about 48 MiB, falling back to Spotlight when exceeded. It is released after the palette stays closed for two minutes. This is an estimate, not a whole-process hard limit.
+- **Preview cache limit:** **16 MiB** by default; choose **8/16/32/64 MiB**. Thumbnails and PDF pages share this budget and a 64-result limit. Lowering it immediately evicts old images and their GPU cache entries. At most two previews are generated concurrently; PDF rasters have a maximum 800-pixel long edge.
+
+The preview budget covers retained image data. Temporary decoding memory, GPUI/Metal, and native macOS Quick Look/services are outside this limit. Start with the defaults on an 8 GB Mac.
+
+**Settings → General → Connections → Enable SSH / SFTP** is off by default. Enable it for server browsing and the existing per-server reconnect options. Disabling it blocks new connections and next-launch reconnection; close existing remote tabs after transfers finish. Saved servers, authentication preferences, and Keychain credentials are retained. System mounts such as SMB remain available. Upstream SSH already runs subprocesses on demand, so disabling it has little effect on baseline memory when no server is connected.
+
+See [PERFORMANCE.md](PERFORMANCE.md) for measurement conditions and results.
+
 ## Keyboard shortcuts
 
 | Action | Shortcut |
@@ -64,7 +81,8 @@ SHUFFLE_CONFIG_DIR=/tmp/shuffle-flow-config cargo run --locked
 | Extract selected archive | ⌥⌘E (added by this fork) |
 | Undo file operation | ⌘Z |
 | Get Info | ⌘I |
-| Quick Look | Space |
+| Open/close Quick Look | Space (Esc also closes) |
+| Navigate Quick Look items | ↑/↓/←/→ |
 | Settings | ⌘, |
 
 Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleared bindings remain cleared; use **Reset Keybinds to Default** if needed. While editing a name, ⌘C/⌘V operate on text. With a composing input method, confirm the candidate before confirming the rename.
@@ -76,6 +94,8 @@ Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleare
 | `src/main.rs` | File browser, file operations, shortcuts, native menus, and settings inherited from upstream and modified here. |
 | `src/i18n.rs` | UI translation catalog and persisted language selection. |
 | `src/ime.rs` | Inline rename's native text-input handler and Unicode/composition range conversion. |
+| `src/quicklook.rs` | Native Quick Look controller, navigation, and browser focus synchronization. |
+| `src/memory.rs` | Bounded LRU caches, Top-K search ranking, and regression tests. |
 | `src/menu_layout.rs` | Independent root/submenu placement and regression tests. |
 | `cloudctl.swift`, `removebg.swift` | Upstream native helpers for iCloud operations and image background removal. |
 | `Cargo.toml`, `Cargo.lock` | Build options and locked Rust dependencies. |
@@ -85,9 +105,9 @@ Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleare
 
 Before this sync, both the local-build and upstream-compatible configurations passed **17 tests** covering composition/range handling, Unicode Finder file URLs, Chinese filenames, copy/move conflicts, archive extraction, shortcuts, and menu placement. The release build and bundle signature checks passed.
 
-After importing the core source, `cargo test --locked` in this repository also passed all **17 tests** with the default Shuffle Flow features.
+The current version passes all **24 tests** with `cargo test --locked` and the default Shuffle Flow features. New coverage includes preview navigation boundaries, cache retention/eviction and immediate budget reduction, ranking equivalence, legacy preference migration, and saved performance/SSH settings.
 
-Actual-window checks confirmed the Shuffle Flow menu name, left-opening/bottom-clamped tag submenu without moving the root, ⇧⌘N folder creation, and saving a pasted Chinese/emoji folder name. Pinyin candidate-window interaction has not yet been manually verified.
+Actual-window checks confirmed the Shuffle Flow menu name, left-opening/bottom-clamped tag submenu without moving the root, ⇧⌘N folder creation, and saving a pasted Chinese/emoji folder name. Native Quick Look was also checked across three Chinese-named text files: Down/Right/Up navigation, updated content, and Space to close. Column-view navigation was checked inside a child directory too. Native panel presentation is deferred outside GPUI updates to avoid reentrant App borrows while preview generators load. The performance/SSH controls were checked in the actual settings window, including persistence after restart. Pinyin candidate-window interaction has not yet been manually verified.
 
 ## Limitations and next improvements
 

@@ -8,10 +8,11 @@ case "$PROFILE" in
     debug) cargo build --locked --features runtime-shaders,local-build ;;
     *) echo "SHUFFLE_PROFILE must be release or debug" >&2; exit 1 ;;
 esac
+BUILD_DIR="${CARGO_TARGET_DIR:-target}"
 APP="Shuffle Flow.app"
 VERSION=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "target/$PROFILE/shuffle" "$APP/Contents/MacOS/shuffle"
+cp "$BUILD_DIR/$PROFILE/shuffle" "$APP/Contents/MacOS/shuffle"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Use the same optional native helpers as the upstream bundle, for the host Mac.
 for helper in removebg cloudctl; do

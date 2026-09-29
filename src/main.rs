@@ -11,6 +11,8 @@
 mod i18n;
 mod ime;
 mod menu_layout;
+mod quicklook;
+mod memory;
 use i18n::{tr, Language};
 
 use std::cell::RefCell;
@@ -359,7 +361,7 @@ fn apply_theme(t: Theme, cx: &mut App) {
 // ----- feature preferences (the General tab toggles) -------------------------
 
 /// User-toggleable features.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Prefs {
     /// Show a terminal-style command input at the bottom of the explorer.
     terminal: bool,
@@ -387,6 +389,12 @@ struct Prefs {
     show_fps: bool,
     /// Run user shell-script actions from the Scripts folder in menus.
     script_actions: bool,
+    /// Avoid retaining a home-directory index; use Spotlight for global search.
+    low_memory: bool,
+    /// Combined thumbnail/PDF image cache limit, in MiB.
+    preview_cache_mb: usize,
+    /// SFTP is optional and disabled until explicitly enabled.
+    ssh_enabled: bool,
     /// SFTP auth: true = delegate to the user's ~/.ssh (config/keys/known_hosts);
     /// false = use the explicit key path saved per server.
     ssh_use_system: bool,
@@ -416,6 +424,9 @@ impl Default for Prefs {
             show_filter_button: true,
             show_fps: false,
             script_actions: false,
+            low_memory: true,
+            preview_cache_mb: 16,
+            ssh_enabled: false,
             ssh_use_system: true,
             ssh_configured: false,
             waterfall: false,
@@ -443,6 +454,9 @@ thread_local! {
         show_filter_button: true,
         show_fps: false,
         script_actions: false,
+        low_memory: true,
+        preview_cache_mb: 16,
+        ssh_enabled: false,
         ssh_use_system: true,
         ssh_configured: false,
         waterfall: false,
@@ -1146,6 +1160,7 @@ fn tab_sections(tab: usize) -> &'static [&'static str] {
             "Inspector",
             "Command Palette",
             "Sidebar",
+            "Performance",
             "Connections",
             "Script Actions",
             "Software Update",
@@ -1653,7 +1668,13 @@ impl Settings {
 
         // Connections (SFTP) section rows: the auth-mode choice, then the saved
         // servers with a Remove button each, then how to add more.
-        let mut connection_rows: Vec<AnyElement> = Vec::new();
+        let mut connection_rows: Vec<AnyElement> = vec![
+            toggle_row("tg-ssh-enabled", "Enable SSH / SFTP", "Off: no new SSH connections or launch reconnection. Close existing remote tabs when finished; saved servers and credentials are retained.", p.ssh_enabled,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs(); np.ssh_enabled = !np.ssh_enabled;
+                    apply_prefs(np, cx); cx.notify();
+                })).into_any_element(),
+        ];
         connection_rows.push(
             toggle_row(
                 "tg-ssh-system",
@@ -1940,6 +1961,29 @@ impl Settings {
                         }),
                     )
                     .into_any_element(),
+                ],
+            ),
+            settings_section(
+                "Performance",
+                Some("Keep everyday file browsing light; enable faster indexed search when needed."),
+                vec![
+                    toggle_row("tg-low-memory", "Lightweight mode (recommended for 8 GB Macs)", "Use Spotlight for global search and release the in-memory home index. Off: build a bounded fuzzy index only when the command palette opens.", p.low_memory,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs(); np.low_memory = !np.low_memory;
+                            apply_prefs(np, cx); cx.notify();
+                        })).into_any_element(),
+                    div().flex().items_center().justify_between()
+                        .child(tr("Preview cache limit"))
+                        .child(div().flex().gap_2().children([8usize, 16, 32, 64].into_iter().map(|mb| {
+                            div().id(("preview-budget", mb)).px_3().py_1().rounded_md().cursor_pointer()
+                                .bg(rgb(if p.preview_cache_mb == mb { t.selected } else { t.surface }))
+                                .child(format!("{mb} MiB"))
+                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    let mut np = prefs(); np.preview_cache_mb = mb;
+                                    apply_prefs(np, cx); cx.notify();
+                                }))
+                        }))).into_any_element(),
+                    div().text_xs().text_color(rgb(t.text_dim)).child(tr("This caps retained thumbnail and PDF image data, not the app's total memory. Lowering it releases old cached images immediately.")).into_any_element(),
                 ],
             ),
             settings_section(
@@ -3818,6 +3862,8 @@ struct Shuffle {
     palette_scroll: ScrollHandle,
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
+    index_attempted: bool,
+    quicklook_polling: bool,
     context_menu: Option<ContextMenu>,
     /// In-progress inline rename, if any.
     rename: Option<Rename>,
@@ -3942,8 +3988,14 @@ impl Shuffle {
         })
         .detach();
         // Sync + repaint whenever feature prefs change.
-        cx.observe_global::<PrefsGlobal>(|_, cx| {
-            set_active_prefs(cx.global::<PrefsGlobal>().0);
+        cx.observe_global::<PrefsGlobal>(|this, cx| {
+            let p = cx.global::<PrefsGlobal>().0;
+            set_active_prefs(p);
+            trim_image_cache(cx);
+            if p.low_memory {
+                this.index = None;
+                this.index_attempted = false;
+            }
             cx.notify();
         })
         .detach();
@@ -4166,6 +4218,8 @@ impl Shuffle {
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
+            index_attempted: false,
+            quicklook_polling: false,
             context_menu: None,
             rename: None,
             sort_menu: None,
@@ -4677,29 +4731,125 @@ impl Shuffle {
         self.begin_rename(pane, path, window, cx);
     }
 
-    /// Quick Look the current selection (spacebar), like Finder. Uses macOS
-    /// `qlmanage -p`, which pops the system preview panel. Local files only —
-    /// remote (SFTP) items aren't on disk for QuickLook to read.
-    fn quick_look(&self, pane: usize) {
+    /// Quick Look stays inside the app, so arrow keys and file selection share
+    /// one session instead of driving an unrelated qlmanage process.
+    fn quick_look(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab(pane).remote.is_some() {
             return;
         }
-        let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
-        if paths.is_empty() {
-            if let Some(a) = self.tab(pane).anchor.clone() {
-                paths.push(a);
-            }
+        let mut selected: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
+        if selected.is_empty() {
+            selected.extend(self.tab(pane).anchor.clone());
         }
-        if paths.is_empty() {
+        self.quick_look_targets(pane, selected, window, cx);
+    }
+
+    fn quick_look_targets(
+        &mut self,
+        pane: usize,
+        selected: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(first) = selected.first() else {
+            return;
+        };
+        let anchor = self
+            .tab(pane)
+            .anchor
+            .as_ref()
+            .filter(|p| selected.contains(p))
+            .unwrap_or(first)
+            .clone();
+        let mut paths = if self.tab(pane).view == ViewMode::Columns {
+            anchor
+                .parent()
+                .map(|dir| {
+                    column_entries(dir)
+                        .iter()
+                        .map(|e| dir.join(&e.name))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.display_paths(pane)
+        };
+        if selected.len() > 1 {
+            paths.retain(|p| selected.contains(p));
+        }
+        if !paths.contains(&anchor) {
+            paths = selected;
+        }
+        let Some(view) = ns_view_ptr(window) else {
+            return;
+        };
+        let stride = if self.tab(pane).view == ViewMode::Icons {
+            self.icon_cols(pane)
+        } else {
+            1
+        };
+        quicklook::show(view, pane, paths, &anchor, stride);
+        if self.quicklook_polling {
             return;
         }
-        paths.sort();
-        let _ = Command::new("qlmanage")
-            .arg("-p")
-            .args(&paths)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        self.quicklook_polling = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let running = this
+                .update(cx, |this, cx| {
+                    let (open, changed) = quicklook::poll();
+                    if let Some((pane, path)) = changed {
+                        if pane < this.panes.len() {
+                            this.active_pane = pane;
+                            if this.tab(pane).view == ViewMode::Columns {
+                                let mut dirs = vec![this.tab(pane).current_dir.clone()];
+                                dirs.extend(this.tab(pane).col_chain.iter().cloned());
+                                if let Some(k) = dirs
+                                    .iter()
+                                    .position(|dir| Some(dir.as_path()) == path.parent())
+                                {
+                                    if let Some(index) = column_entries(&dirs[k])
+                                        .iter()
+                                        .position(|e| dirs[k].join(&e.name) == path)
+                                    {
+                                        this.column_set(pane, k, &dirs, index, cx);
+                                    }
+                                }
+                            } else {
+                                let paths = this.display_paths(pane);
+                                if let Some(index) = paths.iter().position(|p| p == &path) {
+                                    let offset = usize::from(
+                                        this.tab(pane).find_query.is_none()
+                                            && prefs().show_parent
+                                            && this.tab(pane).current_dir.parent().is_some(),
+                                    );
+                                    let item = if this.tab(pane).view == ViewMode::Icons {
+                                        index / this.icon_cols(pane)
+                                    } else {
+                                        index + offset
+                                    };
+                                    let tab = this.tab_mut(pane);
+                                    tab.selection.clear();
+                                    tab.selection.insert(path.clone());
+                                    tab.scroll_handle
+                                        .scroll_to_item(item, ScrollStrategy::Center);
+                                    this.focus_entry(pane, path, cx);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }
+                    this.quicklook_polling = open;
+                    open
+                })
+                .unwrap_or(false);
+            if !running {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
@@ -6422,9 +6572,7 @@ impl Shuffle {
 
     /// After an in-place edit, drop stale caches and refresh the listing.
     fn refresh_after_edit(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        PREVIEW_CACHE.with(|c| {
-            c.borrow_mut().remove(&path);
-        });
+        invalidate_preview(&path, cx);
         INFO_CACHE.with(|c| {
             c.borrow_mut().remove(&path);
         });
@@ -6481,9 +6629,9 @@ impl Shuffle {
             {
                 let ts = targets.clone();
                 let label = if many { format!("Quick Look {n} Items") } else { tr("Quick Look").to_string() };
-                nodes.push(mi_hint(label, "␣", move |this, _, cx| {
+                nodes.push(mi_hint(label, "␣", move |this, window, cx| {
                     this.close_context_menu(cx);
-                    quick_look_paths(&ts);
+                    this.quick_look_targets(pane, ts.clone(), window, cx);
                 }));
             }
             push_menu_sep(&mut nodes);
@@ -7314,6 +7462,11 @@ impl Shuffle {
     // ----- Connect to Server -----
 
     fn open_server_dialog(&mut self, cx: &mut Context<Self>) {
+        if !prefs().ssh_enabled {
+            self.server_dialog = Some(ServerForm::default());
+            cx.notify();
+            return;
+        }
         // First run: ask how to authenticate over SSH (a permission-style
         // prompt), then open the connect dialog. Afterwards, go straight in.
         if !prefs().ssh_configured {
@@ -7362,6 +7515,10 @@ impl Shuffle {
     /// Save an SFTP server from the Credentials tab (password → Keychain) and
     /// connect to it.
     fn submit_credentials(&mut self, cx: &mut Context<Self>) {
+        if !prefs().ssh_enabled {
+            self.set_notice(tr("Enable SSH / SFTP in Settings → General → Connections first.").to_owned(), cx);
+            return;
+        }
         let Some(form) = self.server_dialog.clone() else {
             return;
         };
@@ -7425,6 +7582,10 @@ impl Shuffle {
             return;
         }
         // sftp:// / ssh:// → an in-app SFTP server (saved + connected).
+        if (url.starts_with("sftp://") || url.starts_with("ssh://")) && !prefs().ssh_enabled {
+            self.set_notice(tr("Enable SSH / SFTP in Settings → General → Connections first.").to_owned(), cx);
+            return;
+        }
         if let Some(rest) = url
             .strip_prefix("sftp://")
             .or_else(|| url.strip_prefix("ssh://"))
@@ -8132,13 +8293,24 @@ impl Shuffle {
     }
 
     /// Build the ~/ fuzzy index on a background thread, then store it.
-    fn build_index(&self, cx: &mut Context<Self>) {
+    fn build_index(&mut self, cx: &mut Context<Self>) {
+        if prefs().low_memory || self.index_attempted {
+            return;
+        }
+        self.index_attempted = true;
         cx.spawn(async move |this, cx| {
             let index = cx
                 .background_spawn(async move { FileIndex::build(home_dir()) })
                 .await;
             this.update(cx, |this, cx| {
-                this.index = Some(Arc::new(index));
+                this.index = (!prefs().low_memory && this.palette_open && !index.truncated)
+                    .then(|| Arc::new(index));
+                if !this.palette_open {
+                    this.index_attempted = false;
+                }
+                if this.palette_open {
+                    this.refresh_palette(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -8381,8 +8553,13 @@ impl Shuffle {
     // ----- command palette (Cmd+P) -----
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = !self.palette_open;
         if self.palette_open {
+            self.close_palette(cx);
+            return;
+        }
+        self.palette_open = true;
+        {
+            self.build_index(cx);
             self.query.clear();
             self.query_cursor = 0;
             self.query_anchor = None;
@@ -8397,6 +8574,21 @@ impl Shuffle {
     fn close_palette(&mut self, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.palette_actions = None;
+        if self.index.is_some() {
+            let gen = self.search_gen;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(120))
+                    .await;
+                let _ = this.update(cx, |this, _| {
+                    if !this.palette_open && this.search_gen == gen {
+                        this.index = None;
+                        this.index_attempted = false;
+                    }
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -8970,7 +9162,7 @@ impl Shuffle {
                 }
                 // Spacebar → Quick Look the selection, like Finder.
                 if key == "space" {
-                    self.quick_look(pane);
+                    self.quick_look(pane, window, cx);
                     return;
                 }
             }
@@ -10337,6 +10529,10 @@ impl Shuffle {
     /// Connect to a saved SFTP server: open a new tab, resolve the remote home
     /// directory in the background, and browse it. Errors surface in the banner.
     fn connect_sftp(&mut self, server: SftpServer, cx: &mut Context<Self>) {
+        if !prefs().ssh_enabled {
+            self.set_notice(tr("Enable SSH / SFTP in Settings → General → Connections first.").to_owned(), cx);
+            return;
+        }
         // Open a placeholder remote tab in the active pane immediately.
         let pane = self.active_pane;
         let mut tab = Tab::new(home_dir()); // temporary local dir; replaced below
@@ -10558,6 +10754,7 @@ impl Shuffle {
     /// Make `path` the inspector focus and load its preview/info.
     fn focus_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         self.tab_mut(pane).anchor = Some(path.clone());
+        quicklook::select(&path);
         self.preview_page = 0;
         // Remote files aren't on the local disk, so QuickLook/PDF rendering
         // can't read them directly. Fetch a copy to a temp cache and preview
@@ -11302,12 +11499,41 @@ impl Shuffle {
             let info = cx.background_spawn(async move { gather_info(&p) }).await;
             let _ = this.update(cx, |_, cx| {
                 INFO_CACHE.with(|c| {
-                    c.borrow_mut().insert(path, info);
+                    c.borrow_mut().insert(path, info, 1);
                 });
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A fast sequence of arrow presses must not queue a thumbnail process for
+    /// every intermediate item. When a slot becomes free, retry the latest focus.
+    fn retry_current_preview(&self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_tab().anchor.clone() else {
+            return;
+        };
+        if self.active_tab().remote.is_some() {
+            let size = self
+                .active_tab()
+                .entries
+                .iter()
+                .find(|e| self.active_tab().current_dir.join(&e.name) == path)
+                .map_or(0, |e| e.size);
+            self.ensure_remote_preview(path.clone(), size, cx);
+        } else {
+            self.ensure_preview(
+                path.clone(),
+                self.active_tab().view == ViewMode::Gallery,
+                cx,
+            );
+        }
+        if prefs().preview
+            && prefs().preview_pages
+            && (self.active_tab().remote.is_none() || lookup_pdf_count(&path).is_some())
+        {
+            self.ensure_pdf_page(path, self.preview_page, cx);
+        }
     }
 
     /// Build a preview for `path` in the background (once), then repaint.
@@ -11316,13 +11542,17 @@ impl Shuffle {
         if (!force && !prefs().preview) || lookup_preview(&path).is_some() {
             return;
         }
+        let key = PreviewKey::Thumbnail(path.clone());
+        if !begin_preview(key.clone()) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let p = path.clone();
             let img = cx.background_spawn(async move { build_preview(&p) }).await;
-            let _ = this.update(cx, |_, cx| {
-                PREVIEW_CACHE.with(|c| {
-                    c.borrow_mut().insert(path, img);
-                });
+            finish_preview(&key);
+            let _ = this.update(cx, |this, cx| {
+                insert_preview(path, img, cx);
+                this.retry_current_preview(cx);
                 cx.notify();
             });
         })
@@ -11342,23 +11572,34 @@ impl Shuffle {
         } else {
             path.clone()
         };
+        let key = PreviewKey::Pdf(path.clone(), page);
+        if !begin_preview(key.clone()) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let p = src.clone();
-            let out = cx.background_spawn(async move { render_pdf_page(&p, page) }).await;
+            let out = cx
+                .background_spawn(async move { render_pdf_page(&p, page) })
+                .await;
+            finish_preview(&key);
             let _ = this.update(cx, |this, cx| {
                 match out {
                     Some((img, count)) => {
-                        insert_pdf_page(path.clone(), page, Some(img));
+                        insert_pdf_page(path.clone(), page, Some(img), cx);
                         PDF_COUNT_CACHE.with(|c| {
-                            c.borrow_mut().insert(path.clone(), count);
+                            c.borrow_mut().insert(path.clone(), count, 1);
                         });
                         // Have the second page ready before the first ‹ › click.
-                        if page == 0 && count > 1 {
+                        if page == 0
+                            && count > 1
+                            && this.active_tab().anchor.as_ref() == Some(&path)
+                        {
                             this.ensure_pdf_page(path, 1, cx);
                         }
                     }
-                    None => insert_pdf_page(path, page, None),
+                    None => insert_pdf_page(path, page, None, cx),
                 }
+                this.retry_current_preview(cx);
                 cx.notify();
             });
         })
@@ -11383,8 +11624,12 @@ impl Shuffle {
         // Cap the download; mark oversized files unavailable so we don't retry.
         const MAX_PREVIEW_BYTES: u64 = 40 * 1024 * 1024;
         if size > MAX_PREVIEW_BYTES {
-            PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path, None));
+            insert_preview(remote_path, None, cx);
             cx.notify();
+            return;
+        }
+        let key = PreviewKey::Thumbnail(remote_path.clone());
+        if !begin_preview(key.clone()) {
             return;
         }
         let use_system = prefs().ssh_use_system;
@@ -11405,28 +11650,34 @@ impl Shuffle {
                     match sftp_batch(&s, &script, use_system) {
                         Ok(_) => {
                             let img = build_preview(&local);
-                            let pdf = if want_pdf { render_pdf_page(&local, 0) } else { None };
+                            let pdf = if want_pdf {
+                                render_pdf_page(&local, 0)
+                            } else {
+                                None
+                            };
                             Some((img, pdf))
                         }
                         Err(_) => None,
                     }
                 })
                 .await;
-            let _ = this.update(cx, |_this, cx| {
+            finish_preview(&key);
+            let _ = this.update(cx, |this, cx| {
                 match built {
                     Some((img, pdf)) => {
-                        PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path.clone(), img));
+                        insert_preview(remote_path.clone(), img, cx);
                         if let Some((pimg, count)) = pdf {
-                            insert_pdf_page(remote_path.clone(), 0, Some(pimg));
+                            insert_pdf_page(remote_path.clone(), 0, Some(pimg), cx);
                             PDF_COUNT_CACHE
-                                .with(|c| c.borrow_mut().insert(remote_path.clone(), count));
+                                .with(|c| c.borrow_mut().insert(remote_path.clone(), count, 1));
                         }
                     }
                     // Download/build failed → cache "unavailable" (shows the icon).
                     None => {
-                        PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path.clone(), None));
+                        insert_preview(remote_path.clone(), None, cx);
                     }
                 }
+                this.retry_current_preview(cx);
                 cx.notify();
             });
         })
@@ -12715,7 +12966,7 @@ impl Shuffle {
                 push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
             }
             // Saved SFTP servers — click to connect and browse remotely.
-            for server in sftp_servers() {
+            for server in sftp_servers().into_iter().filter(|_| prefs().ssh_enabled) {
                 key += 1;
                 let s = server.clone();
                 let label = server.name.clone();
@@ -14950,19 +15201,6 @@ fn step_menu_sel(nodes: &[MenuNode], cur: Option<usize>, delta: isize) -> Option
         }
     }
     cur
-}
-
-/// Preview files with Quick Look (the same viewer as pressing Space).
-fn quick_look_paths(paths: &[PathBuf]) {
-    if paths.is_empty() {
-        return;
-    }
-    let _ = Command::new("qlmanage")
-        .arg("-p")
-        .args(paths)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 /// Put files on the general pasteboard as file URLs — Finder, Terminal, and
@@ -17784,46 +18022,87 @@ fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
     decode_icon(&tiff)
 }
 
-thread_local! {
-    /// Cache of generated file previews. `None` = generation failed/unavailable.
-    static PREVIEW_CACHE: RefCell<HashMap<PathBuf, Option<Arc<RenderImage>>>> =
-        RefCell::new(HashMap::new());
-    /// Cache of gathered file information.
-    static INFO_CACHE: RefCell<HashMap<PathBuf, FileInfo>> = RefCell::new(HashMap::new());
-}
-
-fn lookup_preview(path: &Path) -> Option<Option<Arc<RenderImage>>> {
-    PREVIEW_CACHE.with(|c| c.borrow().get(path).cloned())
-}
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum PreviewKey { Thumbnail(PathBuf), Pdf(PathBuf, usize) }
 
 thread_local! {
-    /// Rendered PDF pages for the inspector pager: (path, page) → image.
-    /// `None` = that page couldn't be rendered.
-    static PDF_PAGE_CACHE: RefCell<HashMap<(PathBuf, usize), Option<Arc<RenderImage>>>> =
-        RefCell::new(HashMap::new());
-    /// Page counts of PDFs we've rendered at least one page of.
-    static PDF_COUNT_CACHE: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+    // One budget for thumbnails and PDF pages, including failed lookups.
+    static IMAGE_CACHE: RefCell<memory::Cache<PreviewKey, Option<Arc<RenderImage>>>> =
+        RefCell::new(memory::Cache::new(64, memory::IMAGE_BUDGET));
+    static PREVIEW_PENDING: RefCell<HashSet<PreviewKey>> = RefCell::new(HashSet::new());
+    static INFO_CACHE: RefCell<memory::Cache<PathBuf, FileInfo>> = RefCell::new(memory::Cache::new(512, usize::MAX));
+    static PDF_COUNT_CACHE: RefCell<memory::Cache<PathBuf, usize>> = RefCell::new(memory::Cache::new(256, usize::MAX));
 }
 
-fn lookup_pdf_page(path: &Path, page: usize) -> Option<Option<Arc<RenderImage>>> {
-    PDF_PAGE_CACHE.with(|c| c.borrow().get(&(path.to_path_buf(), page)).cloned())
-}
-
-fn lookup_pdf_count(path: &Path) -> Option<usize> {
-    PDF_COUNT_CACHE.with(|c| c.borrow().get(path).copied())
-}
-
-/// Insert a rendered page, evicting far-away pages so flipping through a long
-/// PDF can't accumulate unbounded image memory (each page is a few MB).
-fn insert_pdf_page(path: PathBuf, page: usize, img: Option<Arc<RenderImage>>) {
-    PDF_PAGE_CACHE.with(|c| {
-        let mut m = c.borrow_mut();
-        if m.len() >= 12 {
-            let lo = page.saturating_sub(3);
-            let hi = page + 3;
-            m.retain(|(p, pg), _| p == &path && (lo..=hi).contains(pg));
+fn begin_preview(key: PreviewKey) -> bool {
+    PREVIEW_PENDING.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len() >= memory::PREVIEW_CONCURRENCY {
+            return false;
         }
-        m.insert((path, page), img);
+        pending.insert(key)
+    })
+}
+fn finish_preview(key: &PreviewKey) {
+    PREVIEW_PENDING.with(|pending| {
+        pending.borrow_mut().remove(key);
+    });
+}
+fn trim_image_cache(cx: &mut App) {
+    let evicted = IMAGE_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .set_budget(prefs().preview_cache_mb * 1024 * 1024)
+    });
+    for image in evicted.into_iter().flatten() {
+        cx.drop_image(image, None);
+    }
+}
+fn insert_image(key: PreviewKey, image: Option<Arc<RenderImage>>, cx: &mut App) {
+    trim_image_cache(cx);
+    let cost = image
+        .as_ref()
+        .and_then(|img| img.as_bytes(0))
+        .map_or(0, |bytes| bytes.len());
+    let evicted = IMAGE_CACHE.with(|cache| cache.borrow_mut().insert(key, image, cost));
+    for image in evicted.into_iter().flatten() {
+        cx.drop_image(image, None);
+    }
+}
+fn insert_preview(path: PathBuf, image: Option<Arc<RenderImage>>, cx: &mut App) {
+    insert_image(PreviewKey::Thumbnail(path), image, cx);
+}
+fn lookup_preview(path: &Path) -> Option<Option<Arc<RenderImage>>> {
+    IMAGE_CACHE.with(|c| {
+        c.borrow_mut()
+            .get(&PreviewKey::Thumbnail(path.to_path_buf()))
+            .cloned()
+    })
+}
+fn lookup_pdf_page(path: &Path, page: usize) -> Option<Option<Arc<RenderImage>>> {
+    IMAGE_CACHE.with(|c| {
+        c.borrow_mut()
+            .get(&PreviewKey::Pdf(path.to_path_buf(), page))
+            .cloned()
+    })
+}
+fn lookup_pdf_count(path: &Path) -> Option<usize> {
+    PDF_COUNT_CACHE.with(|c| c.borrow_mut().get(&path.to_path_buf()).copied())
+}
+fn insert_pdf_page(path: PathBuf, page: usize, image: Option<Arc<RenderImage>>, cx: &mut App) {
+    insert_image(PreviewKey::Pdf(path, page), image, cx);
+}
+fn invalidate_preview(path: &Path, cx: &mut App) {
+    let evicted = IMAGE_CACHE.with(|cache| {
+        cache.borrow_mut().remove_matching(|key| match key {
+            PreviewKey::Thumbnail(p) | PreviewKey::Pdf(p, _) => p == path,
+        })
+    });
+    for image in evicted.into_iter().flatten() {
+        cx.drop_image(image, None);
+    }
+    PDF_COUNT_CACHE.with(|c| {
+        c.borrow_mut().remove(&path.to_path_buf());
     });
 }
 
@@ -17832,8 +18111,10 @@ fn insert_pdf_page(path: PathBuf, page: usize, img: Option<Arc<RenderImage>>) {
 fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)> {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-    let bytes = fs::read(path).ok()?;
-    let data = NSData::with_bytes(&bytes);
+    let data = NSData::dataWithContentsOfFile_options_error(
+        &NSString::from_str(&path.to_string_lossy()),
+        objc2_foundation::NSDataReadingOptions::MappedIfSafe,
+    ).ok()?;
     let rep = NSPDFImageRep::imageRepWithData(&data)?;
     let count = rep.pageCount().max(1) as usize;
     rep.setCurrentPage(page.min(count - 1) as isize);
@@ -17844,10 +18125,10 @@ fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)
     }
     // ~800px on the long edge: crisp at the inspector's 288px (incl. retina)
     // without ballooning the page cache.
-    let scale = (800.0 / size.width.max(size.height)).clamp(0.5, 4.0);
+    let scale = (800.0 / size.width.max(size.height)).min(4.0);
     let (w, h) = (
-        (size.width * scale).round() as isize,
-        (size.height * scale).round() as isize,
+        (size.width * scale).round().clamp(1.0, 800.0) as isize,
+        (size.height * scale).round().clamp(1.0, 800.0) as isize,
     );
 
     let bmp = unsafe {
@@ -17894,7 +18175,7 @@ fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)
 }
 
 fn lookup_info(path: &Path) -> Option<FileInfo> {
-    INFO_CACHE.with(|c| c.borrow().get(path).cloned())
+    INFO_CACHE.with(|c| c.borrow_mut().get(&path.to_path_buf()).cloned())
 }
 
 /// Deterministic local temp path for previewing a remote file. Keeps the
@@ -18685,6 +18966,7 @@ struct IndexEntry {
 /// fuzzy search without spawning Spotlight.
 struct FileIndex {
     entries: Vec<IndexEntry>,
+    truncated: bool,
 }
 
 /// Non-hidden directory names we never descend into (huge + irrelevant to file
@@ -18719,7 +19001,7 @@ impl FileIndex {
         // Leave a couple of cores for the UI thread so the (still fairly large)
         // first-launch walk can't starve rendering and make Cmd+P feel frozen.
         let threads = std::thread::available_parallelism()
-            .map(|n| (n.get().saturating_sub(2)).max(2))
+            .map(|n| n.get().saturating_sub(2).clamp(1, 2))
             .unwrap_or(2);
         // `~/Library` is skipped as noise, but the cloud drives live inside
         // it: Dropbox / Google Drive / OneDrive sync to
@@ -18772,6 +19054,8 @@ impl FileIndex {
             });
 
         let mut entries = Vec::new();
+        let mut used_bytes = 0usize;
+        let mut truncated = false;
         for entry in walker {
             let Ok(e) = entry else { continue };
             if e.depth() == 0 {
@@ -18779,13 +19063,18 @@ impl FileIndex {
             }
             let is_dir = e.file_type().is_dir();
             let name = e.file_name().to_string_lossy().into_owned();
-            entries.push(IndexEntry {
-                name,
-                path: e.path(),
-                is_dir,
-            });
+            let path = e.path();
+            // Include allocation overhead and vector spare capacity in this
+            // conservative estimate. Oversized indexes fall back to Spotlight.
+            let cost = name.capacity() + path.as_os_str().len() + 128;
+            if used_bytes.saturating_add(cost) > memory::INDEX_BUDGET {
+                truncated = true;
+                break;
+            }
+            used_bytes += cost;
+            entries.push(IndexEntry { name, path, is_dir });
         }
-        FileIndex { entries }
+        FileIndex { entries, truncated }
     }
 
     /// Fuzzy-rank the index against `query` in parallel; return the top `limit`.
@@ -18796,26 +19085,20 @@ impl FileIndex {
         }
         let q_str: String = q.iter().collect();
         let q_bigrams: Vec<(char, char)> = q.windows(2).map(|w| (w[0], w[1])).collect();
-        let mut scored: Vec<(i32, usize)> = self
-            .entries
-            .par_iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                rank_entry(&q, &q_str, &q_bigrams, &e.name, &e.path, e.is_dir).map(|s| (s, i))
-            })
-            .collect();
-        scored.sort_unstable_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| self.entries[a.1].name.len().cmp(&self.entries[b.1].name.len()))
-        });
-        scored.truncate(limit);
-        scored
-            .into_iter()
-            .map(|(_, i)| {
-                let e = &self.entries[i];
-                (e.name.clone(), e.path.clone(), e.is_dir)
-            })
-            .collect()
+        use std::cmp::Reverse;
+        let top = self.entries.par_iter().enumerate().fold(
+            || memory::TopK::new(limit),
+            |mut top, (i, e)| {
+                if let Some(score) = rank_entry(&q, &q_str, &q_bigrams, &e.name, &e.path, e.is_dir) {
+                    top.push((score, Reverse(e.name.len()), Reverse(i)));
+                }
+                top
+            },
+        ).reduce(|| memory::TopK::new(limit), memory::TopK::merge);
+        top.into_sorted().into_iter().map(|(_, _, Reverse(i))| {
+            let e = &self.entries[i];
+            (e.name.clone(), e.path.clone(), e.is_dir)
+        }).collect()
     }
 }
 
@@ -18955,8 +19238,6 @@ fn index_score(query: &[char], name: &str) -> Option<i32> {
     }
 }
 
-/// Spotlight-backed name search: gather candidates with `mdfind`, then fuzzy
-/// rank by filename. Used as a fallback while the in-memory index is building.
 /// Full-text search inside `dir` via Spotlight: paths whose content matches
 /// `term`. Scoped with `-onlyin` so it's fast and folder-local. Returns the
 /// absolute paths (the in-folder filter keeps only direct children of these).
@@ -18998,63 +19279,53 @@ fn palette_operator_search(
     index: Option<&FileIndex>,
     home: &Path,
 ) -> Vec<PaletteItem> {
-    // 1. Raw candidates: Spotlight content hits, else the whole name index.
-    let mut cands: Vec<(String, PathBuf, bool)> = Vec::new();
-    if let Some(term) = &fq.content {
-        for p in mdfind_content(home, term).into_iter().take(4000) {
-            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            let is_dir = p.is_dir();
-            cands.push((name, p, is_dir));
-        }
-    } else if let Some(idx) = index {
-        cands.reserve(idx.entries.len());
-        for e in &idx.entries {
-            cands.push((e.name.clone(), e.path.clone(), e.is_dir));
-        }
-    }
-
-    // 2. Cheap filter (kind/ext) + optional name ranking — no disk I/O.
+    use std::cmp::Reverse;
     let has_text = !fq.text.is_empty();
-    let mut scored: Vec<(i32, String, PathBuf, bool)> = Vec::new();
-    for (name, path, is_dir) in cands {
-        if !fq.kinds.is_empty() && !fq.kinds.iter().any(|k| k.matches(&name, is_dir)) {
-            continue;
-        }
+    let mut top = memory::TopK::new(400);
+    let mut consider = |name: &str, path: &Path, is_dir: bool| {
+        if !fq.kinds.is_empty() && !fq.kinds.iter().any(|k| k.matches(name, is_dir)) { return; }
         if !fq.exts.is_empty() {
-            let ext = Path::new(&name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
-            match ext {
-                Some(e) if fq.exts.iter().any(|x| x == &e) => {}
-                _ => continue,
-            }
+            let ext = Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_lowercase);
+            if !ext.is_some_and(|ext| fq.exts.contains(&ext)) { return; }
         }
         let score = if has_text {
-            match find_score(&fq.text, &name) {
-                Some(s) => s,
-                None => continue,
-            }
-        } else {
-            0
-        };
-        scored.push((score, name, path, is_dir));
-    }
-
-    // 3. Rank, then cap before the (potentially) stat-heavy stage.
-    if has_text {
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+            let Some(score) = find_score(&fq.text, name) else { return };
+            score
+        } else { 0 };
+        // TopK retains only a small set; lower name lengths break score ties,
+        // while queries without text use alphabetical order.
+        let tie = if has_text { String::new() } else { name.to_lowercase() };
+        top.push((score, Reverse(tie), Reverse(if has_text { name.len() } else { 0 }), name.to_owned(), path.to_path_buf(), is_dir));
+    };
+    if fq.content.is_none() && index.is_some() {
+        for entry in &index.unwrap().entries { consider(&entry.name, &entry.path, entry.is_dir); }
     } else {
-        scored.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        // Also covers an index that exceeded its retention budget. Spotlight
+        // supplies candidates without retaining a second whole-directory index.
+        let query = fq.content.as_ref().map(|term| {
+            let term = term.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("kMDItemTextContent == \"*{term}*\"cd")
+        }).unwrap_or_else(|| "kMDItemFSName == '*'".to_owned());
+        if let Ok(mut child) = Command::new("mdfind").arg("-onlyin").arg(home).arg(&query)
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+            if let Some(stdout) = child.stdout.take() {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { continue };
+                    let path = PathBuf::from(line);
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        consider(name, &path, path.is_dir());
+                    }
+                }
+            }
+            let _ = child.wait();
+        }
     }
-    scored.truncate(400);
+    let scored = top.into_sorted();
 
     // 4. Apply size/date (needs metadata) only to the survivors.
     let need_meta = fq.size.is_some() || fq.after.is_some() || fq.before.is_some();
     let mut out = Vec::new();
-    for (_, name, path, is_dir) in scored {
+    for (_, _, _, name, path, is_dir) in scored {
         if need_meta {
             let md = fs::metadata(&path).ok();
             let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -19097,7 +19368,7 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
     // exact/prefix/coverage/depth signals still rank "Documents" correctly).
     let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
     let q_str: String = q.iter().collect();
-    let mut scored: Vec<(i32, String, PathBuf)> = Vec::new();
+    let mut scored = memory::TopK::new(40);
     // Cap how much we read so a broad query can't stall us.
     for line in BufReader::new(stdout).lines().take(4000) {
         let Ok(line) = line else { continue };
@@ -19115,9 +19386,7 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
     let _ = child.kill();
     let _ = child.wait();
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.truncate(40);
-    scored
+    scored.into_sorted()
         .into_iter()
         .map(|(_, name, path)| {
             let is_dir = path.is_dir();
@@ -19645,17 +19914,25 @@ fn load_menu_style() -> MenuStyle {
     m
 }
 
-/// Persist feature prefs as `key=bool` lines.
+/// Serialize preferences separately from I/O so legacy-file migration is testable.
+fn prefs_text(p: &Prefs) -> String {
+    let mut body = format!(
+        "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\n",
+        p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity
+    );
+    body.push_str(&format!(
+        "low_memory={}\npreview_cache_mb={}\nssh_enabled={}\n",
+        p.low_memory, p.preview_cache_mb, p.ssh_enabled
+    ));
+    body
+}
+
 fn save_prefs(p: &Prefs) {
     if let Some(file) = config_file("prefs.txt") {
         if let Some(parent) = file.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity
-        );
-        let _ = fs::write(&file, body);
+        let _ = fs::write(&file, prefs_text(p));
     }
 }
 
@@ -19764,48 +20041,58 @@ fn load_keymap() -> Keymap {
     k
 }
 
-/// Load feature prefs, defaulting everything to off.
-fn load_prefs() -> Prefs {
+/// Missing fields retain safe defaults when upgrading an existing configuration.
+fn parse_prefs(s: &str) -> Prefs {
     let mut p = Prefs::default();
-    if let Some(file) = config_file("prefs.txt") {
-        if let Ok(s) = fs::read_to_string(&file) {
-            for line in s.lines() {
-                let Some((k, v)) = line.split_once('=') else {
-                    continue;
-                };
-                let on = v.trim() == "true";
-                match k.trim() {
-                    "terminal" => p.terminal = on,
-                    "term_history" => p.term_history = on,
-                    "preview" => p.preview = on,
-                    "preview_pages" => p.preview_pages = on,
-                    "info" => p.info = on,
-                    "show_parent" => p.show_parent = on,
-                    "sidebar_collapsed" => p.sidebar_collapsed = on,
-                    "recent_limit" => {
-                        if let Ok(n) = v.trim().parse::<usize>() {
-                            p.recent_limit = n.min(RECENTS_CAP);
-                        }
-                    }
-                    "palette_history" => p.palette_history = on,
-                    "groups_enabled" => p.groups_enabled = on,
-                    "show_filter_button" => p.show_filter_button = on,
-                    "show_fps" => p.show_fps = on,
-                    "script_actions" => p.script_actions = on,
-                    "ssh_use_system" => p.ssh_use_system = on,
-                    "ssh_configured" => p.ssh_configured = on,
-                    "waterfall" => p.waterfall = on,
-                    "palette_opacity" => {
-                        if let Ok(n) = v.trim().parse::<u8>() {
-                            p.palette_opacity = n.clamp(20, 100);
-                        }
-                    }
-                    _ => {}
+    for line in s.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let on = v.trim() == "true";
+        match k.trim() {
+            "terminal" => p.terminal = on,
+            "term_history" => p.term_history = on,
+            "preview" => p.preview = on,
+            "preview_pages" => p.preview_pages = on,
+            "info" => p.info = on,
+            "show_parent" => p.show_parent = on,
+            "sidebar_collapsed" => p.sidebar_collapsed = on,
+            "recent_limit" => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    p.recent_limit = n.min(RECENTS_CAP);
                 }
             }
+            "palette_history" => p.palette_history = on,
+            "groups_enabled" => p.groups_enabled = on,
+            "show_filter_button" => p.show_filter_button = on,
+            "show_fps" => p.show_fps = on,
+            "script_actions" => p.script_actions = on,
+            "low_memory" => p.low_memory = on,
+            "ssh_enabled" => p.ssh_enabled = on,
+            "preview_cache_mb" => {
+                if let Ok(n @ (8 | 16 | 32 | 64)) = v.trim().parse::<usize>() {
+                    p.preview_cache_mb = n;
+                }
+            }
+            "ssh_use_system" => p.ssh_use_system = on,
+            "ssh_configured" => p.ssh_configured = on,
+            "waterfall" => p.waterfall = on,
+            "palette_opacity" => {
+                if let Ok(n) = v.trim().parse::<u8>() {
+                    p.palette_opacity = n.clamp(20, 100);
+                }
+            }
+            _ => {}
         }
     }
     p
+}
+
+fn load_prefs() -> Prefs {
+    config_file("prefs.txt")
+        .and_then(|file| fs::read_to_string(file).ok())
+        .map(|text| parse_prefs(&text))
+        .unwrap_or_default()
 }
 
 fn main() {
@@ -20045,6 +20332,7 @@ fn main() {
             }
         };
         let index = FileIndex {
+            truncated: false,
             entries: vec![
                 mk("/Users/guzma/Documents", true),
                 mk("/Users/guzma/Downloads", true),
@@ -20277,7 +20565,6 @@ fn open_main_window(cx: &mut App) {
             let view = cx.new(|cx| {
                 let mut finder = Shuffle::new(load_last_dir(), cx);
                 finder.prewarm_icons(cx);
-                finder.build_index(cx);
                 // Quietly check GitHub for a newer release (shows a banner if so).
                 finder.check_for_update(cx);
                 // Reopen last run's tabs + split (else the last folder), then
@@ -20287,7 +20574,7 @@ fn open_main_window(cx: &mut App) {
                     finder.reload_pane(pane, cx);
                 }
                 // Reconnect any SFTP servers marked "reconnect on launch".
-                for server in sftp_servers().into_iter().filter(|s| s.auto_reopen) {
+                for server in sftp_servers().into_iter().filter(|s| prefs().ssh_enabled && s.auto_reopen) {
                     finder.connect_sftp(server, cx);
                 }
                 finder
@@ -20302,6 +20589,40 @@ fn open_main_window(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_preferences_keep_choices_and_use_lightweight_defaults() {
+        let p = parse_prefs(
+            "preview=true\nssh_configured=true\nssh_use_system=false\nunknown=future\n",
+        );
+        assert!(p.preview && p.ssh_configured && !p.ssh_use_system);
+        assert!(p.low_memory && !p.ssh_enabled);
+        assert_eq!(p.preview_cache_mb, 16);
+        for invalid in ["0", "7", "17", "1024", "18446744073709551616", "bad"] {
+            assert_eq!(
+                parse_prefs(&format!("preview_cache_mb={invalid}")).preview_cache_mb,
+                16
+            );
+        }
+    }
+
+    #[test]
+    fn performance_and_connection_preferences_survive_restart() {
+        for mb in [8, 16, 32, 64] {
+            let p = Prefs {
+                low_memory: false,
+                preview_cache_mb: mb,
+                ssh_enabled: true,
+                preview: true,
+                ..Prefs::default()
+            };
+            assert_eq!(parse_prefs(&prefs_text(&p)), p);
+        }
+        assert_eq!(
+            parse_prefs(&prefs_text(&Prefs::default())),
+            Prefs::default()
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("shuffle-test-{name}-{}", std::process::id()));
