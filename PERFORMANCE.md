@@ -14,6 +14,28 @@ SSH/SFTP is disabled by default and does not reconnect saved servers until enabl
 
 SSH/SFTP 默认关闭，启用后才允许服务器连接和启动重连。它原本使用按需启动的系统进程；开关不会移除已编译的代码，也不会终止正在传输的任务。已有远程标签页请在操作完成后关闭。
 
+## Terminal sampler / 终端采样脚本
+
+Open Shuffle Flow, then run from the repository root. No extra dependencies or output files are required:
+
+先打开 Shuffle Flow，再在仓库目录执行。无需额外依赖，也不生成日志文件：
+
+```sh
+./scripts/memory-check.sh
+# About five minutes / 约五分钟：
+./scripts/memory-check.sh -i 5 -n 60
+# Select a specific process / 指定进程：
+./scripts/memory-check.sh -p 12345 -i 5 -n 12
+```
+
+The default takes 12 samples, waiting five seconds between samples. It prints RSS, physical footprint, and CPU to the terminal, then averages and maxima; Ctrl+C ends early with a summary. The historical physical peak reported by `vmmap` is shown separately from the maximum observed by the script. If several app copies are running, select one with `-p`. If `vmmap` cannot inspect the target, physical footprint is shown as `-`; RSS/CPU still work. Only the selected process is included, not Quick Look services or SSH children. `vmmap` adds sampling overhead, so use a five-second or longer interval for normal comparisons.
+
+默认采样 12 次，每次之间等待 5 秒。终端实时显示 RSS、物理占用和 CPU，结束后汇总平均值与采样最大值；Ctrl+C 可提前结束并汇总。`vmmap` 报告的进程历史物理峰值单独列出，与脚本采样最大值区分。同时运行多个应用副本时，请用 `-p` 选择 PID。若 `vmmap` 无法读取，物理占用显示为 `-`，RSS 和 CPU 仍可采样。只统计选定进程，不包含 Quick Look 服务或 SSH 子进程。`vmmap` 采样本身有开销，日常比较建议间隔至少 5 秒。
+
+For a baseline comparison, sample an idle app first, then repeat while browsing folders, copying files, or previewing. Use the same folders and actions for both versions. Finder can be sampled separately with `./scripts/memory-check.sh -p "$(pgrep -x Finder)"`; comparisons need matching workloads and should also account for external services.
+
+基础占用可先在应用闲置时采样，再分别浏览目录、复制文件或打开预览；比较前后版本时使用同一目录和相同操作。Finder 可单独使用 `./scripts/memory-check.sh -p "$(pgrep -x Finder)"` 采样；比较时需控制相同工作负载，也要考虑外部服务占用。
+
 ## Local startup sample / 本机启动采样
 
 Measured on 2026-09-29: Apple Silicon, 8 GB RAM, macOS 27.0 (26A428), release build. Separate fresh configurations opened the same directory containing three small Chinese-named text files, with inspector preview off and no SSH connections. The baseline was the previous Shuffle Flow release with eager indexing, not unmodified upstream Shuffle.
