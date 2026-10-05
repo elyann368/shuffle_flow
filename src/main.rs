@@ -8,6 +8,7 @@
 //! Clicking any item navigates the main listing. The active location is
 //! highlighted. State lives in ~/Library/Application Support/Shuffle/.
 
+mod file_clipboard;
 mod i18n;
 mod ime;
 mod menu_layout;
@@ -68,6 +69,7 @@ actions!(
         NewTab,
         NewFolder,
         CopyFiles,
+        CutFiles,
         PasteFiles,
         MoveFilesHere,
         ExtractArchive,
@@ -782,6 +784,7 @@ enum KeyAction {
     NewFile,
     NewFolder,
     Copy,
+    Cut,
     Paste,
     MoveHere,
     Extract,
@@ -821,6 +824,7 @@ impl KeyAction {
         KeyAction::NewFile,
         KeyAction::NewFolder,
         KeyAction::Copy,
+        KeyAction::Cut,
         KeyAction::Paste,
         KeyAction::MoveHere,
         KeyAction::Extract,
@@ -876,6 +880,7 @@ impl KeyAction {
             KeyAction::SelectAll => "select_all",
             KeyAction::NewFile => "new_file",
             KeyAction::Copy => "copy",
+            KeyAction::Cut => "cut",
             KeyAction::Paste => "paste",
             KeyAction::MoveHere => "move_here",
             KeyAction::Extract => "extract",
@@ -915,6 +920,7 @@ impl KeyAction {
             KeyAction::SelectAll => "Select all",
             KeyAction::NewFile => "New file",
             KeyAction::Copy => "Copy",
+            KeyAction::Cut => "Cut",
             KeyAction::Paste => "Paste",
             KeyAction::MoveHere => "Move Items Here",
             KeyAction::Extract => "Extract Here",
@@ -949,6 +955,7 @@ impl KeyAction {
         match self {
             KeyAction::CommandPalette => Some("cmd-p"),
             KeyAction::Copy => Some("cmd-c"),
+            KeyAction::Cut => Some("cmd-x"),
             KeyAction::CopyPath => Some("cmd-shift-d"),
             KeyAction::CopyFolderPath => Some("cmd-shift-f"),
             KeyAction::OpenTerminal => Some("cmd-shift-t"),
@@ -3489,6 +3496,7 @@ fn mi_shortcut(
     // Menu hints are static in upstream; show these only for default bindings.
     if keymap().get(action) == action.default_binding() {
         let hint = match action {
+            KeyAction::Cut => Some("⌘X"),
             KeyAction::CopyPath => Some("⌘⇧D"),
             KeyAction::CopyFolderPath => Some("⌘⇧F"),
             KeyAction::OpenTerminal => Some("⌘⇧T"),
@@ -5040,32 +5048,64 @@ impl Shuffle {
     /// already there, a folder into itself/its own descendant, and anything
     /// whose name is taken in the destination (never clobbers).
     fn move_items(&mut self, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.move_items_with_cut(dest_dir, srcs, None, cx);
+    }
+
+    fn move_items_with_cut(
+        &mut self,
+        dest_dir: PathBuf,
+        srcs: Vec<PathBuf>,
+        cut_revision: Option<isize>,
+        cx: &mut Context<Self>,
+    ) {
         if !dest_dir.is_dir() {
             return;
         }
+        // A new attempt replaces the previous local transfer warning.
+        self.remote_error = None;
+        cx.notify();
         let mut conflicts = Vec::new();
         let pairs: Vec<(PathBuf, PathBuf)> = srcs
             .into_iter()
             .filter(|src| {
-                src.parent() != Some(dest_dir.as_path()) && dest_dir != *src && !dest_dir.starts_with(src)
+                src.parent() != Some(dest_dir.as_path())
+                    && dest_dir != *src
+                    && !dest_dir.starts_with(src)
             })
             .filter_map(|src| {
                 let dest = dest_dir.join(src.file_name()?);
                 if fs::symlink_metadata(&dest).is_ok() {
                     conflicts.push(path_label(&dest));
                     None
-                } else { Some((src, dest)) }
+                } else {
+                    Some((src, dest))
+                }
             })
             .collect();
         if !conflicts.is_empty() {
-            self.remote_error = Some(localized!("Skipped existing items: {}", "跳过已有同名项目：{}", conflicts.join(", ")));
+            self.remote_error = Some(localized!(
+                "Skipped existing items: {}",
+                "跳过已有同名项目：{}",
+                conflicts.join(", ")
+            ));
             cx.notify();
         }
         if pairs.is_empty() {
             return;
         }
-        let label = localized!("Moving {} to {}", "正在将 {} 移到 {}", items_label(pairs.len()), path_label(&dest_dir));
-        self.start_transfer(pairs, TransferKind::Move, label, true, cx);
+        if let Some(revision) = cut_revision {
+            if !CUT_CLIPBOARD.with(|cut| cut.borrow_mut().begin(revision)) {
+                self.set_notice(tr("A cut operation is already in progress.").into(), cx);
+                return;
+            }
+        }
+        let label = localized!(
+            "Moving {} to {}",
+            "正在将 {} 移到 {}",
+            items_label(pairs.len()),
+            path_label(&dest_dir)
+        );
+        self.start_transfer_with_cut(pairs, TransferKind::Move, label, true, cut_revision, cx);
     }
 
     /// Copy `srcs` into `dest_dir` as one undoable background job; a taken
@@ -5106,15 +5146,34 @@ impl Shuffle {
         undoable: bool,
         cx: &mut Context<Self>,
     ) {
+        self.start_transfer_with_cut(pairs, kind, label, undoable, None, cx);
+    }
+
+    fn start_transfer_with_cut(
+        &mut self,
+        pairs: Vec<(PathBuf, PathBuf)>,
+        kind: TransferKind,
+        label: String,
+        undoable: bool,
+        cut_revision: Option<isize>,
+        cx: &mut Context<Self>,
+    ) {
         let prog = Arc::new(JobProgress::default());
         self.next_job_id += 1;
         let id = self.next_job_id;
         let was_idle = self.jobs.is_empty();
-        self.jobs.push(FileJob { id, label, started: Instant::now(), prog: prog.clone() });
+        self.jobs.push(FileJob {
+            id,
+            label,
+            started: Instant::now(),
+            prog: prog.clone(),
+        });
         if was_idle {
             // Repaint the progress panel while anything is running.
             cx.spawn(async move |this, cx| loop {
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
                 let running = this.update(cx, |this, cx| {
                     cx.notify();
                     !this.jobs.is_empty()
@@ -5126,9 +5185,14 @@ impl Shuffle {
             .detach();
         }
         cx.spawn(async move |this, cx| {
-            let (done, err) = cx.background_spawn(async move { run_transfer(&pairs, kind, &prog) }).await;
+            let (done, err) = cx
+                .background_spawn(async move { run_transfer(&pairs, kind, &prog) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.jobs.retain(|j| j.id != id);
+                if let Some(revision) = cut_revision {
+                    finish_cut_clipboard(revision, &done);
+                }
                 if undoable && !done.is_empty() {
                     this.push_undo(UndoOp::Transfer { kind, pairs: done });
                 }
@@ -6633,6 +6697,7 @@ impl Shuffle {
     fn menu_nodes_root(&self, pane: usize, target: Option<(PathBuf, bool)>) -> Vec<MenuNode> {
         let mut nodes: Vec<MenuNode> = Vec::new();
         let paste_n = pasteboard_file_paths().len();
+        let pasting_cut = cut_clipboard_paths().is_some();
         let on_background = target.is_none();
         if let Some((path, is_dir)) = target {
             // Clicking inside a multi-selection acts on the whole selection
@@ -6755,7 +6820,15 @@ impl Shuffle {
                 let label = if many { localized!("Copy {n} Items", "复制 {n} 个项目") } else { tr("Copy").to_string() };
                 nodes.push(mi(label, move |this, _, cx| {
                     this.close_context_menu(cx);
-                    copy_files_to_pasteboard(&ts);
+                    this.copy_files(&ts, cx);
+                }));
+            }
+            {
+                let ts = targets.clone();
+                let label = if many { localized!("Cut {n} Items", "剪切 {n} 个项目") } else { tr("Cut").to_string() };
+                nodes.push(mi_shortcut(label, KeyAction::Cut, move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    this.cut_files(ts.clone(), cx);
                 }));
             }
             for (folder_only, action, label) in [(false, KeyAction::CopyPath, "Copy Full Path"), (true, KeyAction::CopyFolderPath, "Copy Enclosing Folder Path")] {
@@ -6768,7 +6841,9 @@ impl Shuffle {
             }
             if !many && is_dir && paste_n > 0 {
                 let d = path.clone();
-                let label = if paste_n == 1 {
+                let label = if pasting_cut {
+                    localized!("Move {paste_n} Items Into Folder", "将 {paste_n} 个项目移入文件夹")
+                } else if paste_n == 1 {
                     tr("Paste 1 Item Into Folder").to_string()
                 } else {
                     localized!("Paste {paste_n} Items Into Folder", "将 {paste_n} 个项目粘贴到文件夹")
@@ -6910,10 +6985,10 @@ impl Shuffle {
             }
             push_menu_sep(&mut nodes);
         } else if paste_n > 0 {
-            let label = if paste_n == 1 { tr("Paste 1 Item").to_string() } else { localized!("Paste {paste_n} Items", "粘贴 {paste_n} 个项目") };
+            let label = if pasting_cut { localized!("Move {paste_n} Items Here", "将 {paste_n} 个项目移到此处") } else if paste_n == 1 { tr("Paste 1 Item").to_string() } else { localized!("Paste {paste_n} Items", "粘贴 {paste_n} 个项目") };
             nodes.push(mi(label, move |this, _, cx| {
                 this.close_context_menu(cx);
-                let dir = this.tab(pane).current_dir.clone();
+                let dir = this.shortcut_directory(pane);
                 this.paste_into(pane, dir, cx);
             }));
             push_menu_sep(&mut nodes);
@@ -7135,8 +7210,50 @@ impl Shuffle {
         items
     }
 
-    /// Paste the pasteboard's files into `dir` (background copy, then refresh).
+    fn copy_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() { return; }
+        if copy_files_to_pasteboard(paths).is_some() {
+            let n = paths.len();
+            self.set_notice(localized!("Copied {n} items", "已复制 {n} 个项目"), cx);
+        } else {
+            self.set_notice(tr("Could not write files to the clipboard.").into(), cx);
+        }
+    }
+
+    /// Cut only marks local files; source bytes remain untouched until paste.
+    fn cut_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let n = paths.len();
+        if let Some(revision) = copy_files_to_pasteboard(&paths) {
+            CUT_CLIPBOARD.with(|cut| cut.borrow_mut().set(revision, paths));
+            self.set_notice(
+                localized!(
+                    "Cut {n} items — paste to move them",
+                    "已剪切 {n} 个项目，粘贴后移动"
+                ),
+                cx,
+            );
+        } else {
+            self.set_notice(tr("Could not write files to the clipboard.").into(), cx);
+        }
+    }
+
+    fn move_clipboard_into(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if let Some((revision, paths)) = cut_clipboard_paths() {
+            self.move_items_with_cut(dir, paths, Some(revision), cx);
+        } else {
+            self.move_items(dir, pasteboard_file_paths(), cx);
+        }
+    }
+
+    /// Paste cuts as moves; ordinary file URLs remain copies.
     fn paste_into(&mut self, _pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        if cut_clipboard_paths().is_some() {
+            self.move_clipboard_into(dir, cx);
+            return;
+        }
         let srcs = pasteboard_file_paths();
         if srcs.is_empty() {
             return;
@@ -9043,17 +9160,27 @@ impl Shuffle {
             }
             KeyAction::Copy => {
                 if self.tab(pane).remote.is_none() {
-                    copy_files_to_pasteboard(&self.action_targets(pane));
+                    self.copy_files(&self.action_targets(pane), cx);
+                }
+            }
+            KeyAction::Cut => {
+                if self.tab(pane).remote.is_none() {
+                    // Unlike Copy's anchor fallback, Cut requires an actual selection.
+                    let mut paths: Vec<_> = self.tab(pane).selection.iter().cloned().collect();
+                    paths.sort();
+                    self.cut_files(paths, cx);
+                } else {
+                    self.set_notice(tr("Cut is available for local files only.").into(), cx);
                 }
             }
             KeyAction::Paste => {
                 if self.tab(pane).remote.is_none() {
-                    self.paste_into(pane, self.tab(pane).current_dir.clone(), cx);
+                    self.paste_into(pane, self.shortcut_directory(pane), cx);
                 }
             }
             KeyAction::MoveHere => {
                 if self.tab(pane).remote.is_none() {
-                    self.move_items(self.tab(pane).current_dir.clone(), pasteboard_file_paths(), cx);
+                    self.move_clipboard_into(self.shortcut_directory(pane), cx);
                 }
             }
             KeyAction::Extract => {
@@ -14734,6 +14861,9 @@ impl Render for Shuffle {
             // Focusable so it receives key events (Cmd+P, palette typing).
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &CutFiles, window, cx| {
+                this.dispatch_file_menu(KeyAction::Cut, "x", window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CopyFiles, window, cx| {
                 this.dispatch_file_menu(KeyAction::Copy, "c", window, cx);
             }))
@@ -15307,8 +15437,11 @@ fn step_menu_sel(nodes: &[MenuNode], cur: Option<usize>, delta: isize) -> Option
 /// Put files on the general pasteboard as file URLs — Finder, Terminal, and
 /// every other app understand a paste after this (same writer the drag-out
 /// code uses).
-fn copy_files_to_pasteboard(paths: &[PathBuf]) {
-    if paths.is_empty() { return; }
+fn copy_files_to_pasteboard(paths: &[PathBuf]) -> Option<isize> {
+    if paths.is_empty() {
+        return None;
+    }
+    CUT_CLIPBOARD.with(|cut| cut.borrow_mut().clear());
     use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
     use objc2_foundation::NSArray;
@@ -15318,9 +15451,42 @@ fn copy_files_to_pasteboard(paths: &[PathBuf]) {
         .iter()
         .map(|p| NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy())))
         .collect();
-    let writers: Vec<&ProtocolObject<dyn NSPasteboardWriting>> =
-        urls.iter().map(|u| ProtocolObject::from_ref(&**u)).collect();
-    let _ = pb.writeObjects(&NSArray::from_slice(&writers));
+    let writers: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+        .iter()
+        .map(|u| ProtocolObject::from_ref(&**u))
+        .collect();
+    pb.writeObjects(&NSArray::from_slice(&writers))
+        .then(|| pb.changeCount())
+}
+
+thread_local! {
+    // One lightweight, process-local cut batch shared by explorer windows.
+    static CUT_CLIPBOARD: RefCell<file_clipboard::CutClipboard> = RefCell::new(file_clipboard::CutClipboard::default());
+}
+
+fn cut_clipboard_paths() -> Option<(isize, Vec<PathBuf>)> {
+    let revision = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
+    CUT_CLIPBOARD.with(|cut| {
+        cut.borrow_mut()
+            .paths(revision)
+            .map(|paths| (revision, paths.to_vec()))
+    })
+}
+
+fn finish_cut_clipboard(revision: isize, done: &[(PathBuf, PathBuf)]) {
+    let pb = objc2_app_kit::NSPasteboard::generalPasteboard();
+    if pb.changeCount() != revision {
+        return;
+    }
+    let moved: Vec<_> = done.iter().map(|(src, _)| src.clone()).collect();
+    let remaining = CUT_CLIPBOARD.with(|cut| cut.borrow_mut().complete(revision, &moved));
+    if let Some(paths) = remaining {
+        if paths.is_empty() {
+            let _ = pb.clearContents();
+        } else if let Some(revision) = copy_files_to_pasteboard(&paths) {
+            CUT_CLIPBOARD.with(|cut| cut.borrow_mut().set(revision, paths));
+        }
+    }
 }
 
 /// Read file URLs off the general pasteboard (whatever Copy above — or
@@ -16142,6 +16308,7 @@ fn run_transfer(
     let mut err = None;
     let mut to_copy = Vec::new();
     for (src, dest) in pairs {
+        if prog.cancel.load(Ordering::Relaxed) { break; }
         if fs::symlink_metadata(dest).is_ok() {
             err = Some(localized!("“{}” already exists there", "目标位置已存在“{}”", path_label(dest)));
             continue;
@@ -16173,6 +16340,8 @@ fn run_transfer(
                     };
                     if let Err(e) = removed {
                         err = Some(localized!("Copied “{}” but couldn't remove the original: {e}", "已复制“{}”，但无法删除原件：{e}", path_label(&src)));
+                        // The source still exists: it is not a completed move.
+                        continue;
                     }
                 }
                 done.push((src, dest));
@@ -20642,6 +20811,7 @@ fn install_menus(cx: &mut App) {
             Menu {
                 name: tr("Edit").into(),
                 items: vec![
+                    MenuItem::action(tr("Cut"), CutFiles),
                     MenuItem::action(tr("Copy"), CopyFiles),
                     MenuItem::action(tr("Paste"), PasteFiles),
                     MenuItem::action(tr("Move Items Here"), MoveFilesHere),
@@ -20762,7 +20932,7 @@ mod tests {
     #[test]
     fn finder_shortcuts_and_customization() {
         let mut keymap = Keymap::defaults();
-        for (binding, action) in [("cmd-c", KeyAction::Copy), ("cmd-v", KeyAction::Paste),
+        for (binding, action) in [("cmd-c", KeyAction::Copy), ("cmd-x", KeyAction::Cut), ("cmd-v", KeyAction::Paste),
             ("cmd-alt-v", KeyAction::MoveHere), ("cmd-shift-n", KeyAction::NewFolder),
             ("cmd-down", KeyAction::Open), ("cmd-backspace", KeyAction::MoveToTrash),
             ("cmd-alt-e", KeyAction::Extract)] {
@@ -20775,8 +20945,13 @@ mod tests {
 
     #[test]
     fn mnemonic_shortcuts_preserve_existing_bindings_and_scopes() {
+        let migrated = parse_keymap("copy=cmd-x\n");
+        assert!(migrated.get(KeyAction::Cut).is_none());
+        assert!(migrated.action_for("cmd-x") == Some(KeyAction::Copy));
+        assert_eq!(parse_keymap("cut=\n").get(KeyAction::Cut), None);
         let k = Keymap::defaults();
         for (binding, action) in [
+            ("cmd-x", KeyAction::Cut),
             ("cmd-shift-t", KeyAction::OpenTerminal),
             ("cmd-shift-d", KeyAction::CopyPath),
             ("cmd-shift-f", KeyAction::CopyFolderPath),
@@ -20795,6 +20970,61 @@ mod tests {
         k.bind_unique(KeyAction::CopyPath, "cmd-a".into());
         assert!(k.get(KeyAction::SelectAll).is_none());
         assert_eq!(k.get(KeyAction::PaletteSelectAll), Some("cmd-a"));
+    }
+
+    #[test]
+    fn cut_move_keeps_conflicts_retries_and_is_reversible() {
+        let d = scratch("cut-move");
+        let src = d.join("原目录");
+        let dst = d.join("目标目录");
+        fs::create_dir_all(src.join("中文 😀 文件夹")).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let folder = src.join("中文 😀 文件夹");
+        fs::write(folder.join("内容.txt"), "文件夹内容").unwrap();
+        let conflict = src.join("报告.txt");
+        fs::write(&conflict, "原文件").unwrap();
+        fs::write(dst.join("报告.txt"), "已存在文件").unwrap();
+        let pairs = vec![
+            (folder.clone(), dst.join("中文 😀 文件夹")),
+            (conflict.clone(), dst.join("报告.txt")),
+        ];
+        let mut cut = file_clipboard::CutClipboard::default();
+        cut.set(100, vec![folder.clone(), conflict.clone()]);
+        assert!(folder.exists() && conflict.exists()); // Marking does not remove files.
+        assert!(cut.begin(100));
+        let (done, error) = run_transfer(&pairs, TransferKind::Move, &JobProgress::default());
+        assert!(error.is_some());
+        assert_eq!(
+            cut.complete(100, &done.iter().map(|p| p.0.clone()).collect::<Vec<_>>())
+                .unwrap(),
+            vec![conflict.clone()]
+        );
+        assert!(!folder.exists());
+        assert_eq!(
+            fs::read_to_string(dst.join("中文 😀 文件夹/内容.txt")).unwrap(),
+            "文件夹内容"
+        );
+        assert_eq!(fs::read_to_string(&conflict).unwrap(), "原文件");
+        assert_eq!(
+            fs::read_to_string(dst.join("报告.txt")).unwrap(),
+            "已存在文件"
+        );
+        let back: Vec<_> = done.into_iter().map(|(a, b)| (b, a)).collect();
+        let (undone, error) = run_transfer(&back, TransferKind::Move, &JobProgress::default());
+        assert_eq!(undone.len(), 1);
+        assert!(error.is_none() && folder.exists());
+        let cancelled = JobProgress::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let (done, _) = run_transfer(
+            &back
+                .iter()
+                .map(|(a, b)| (b.clone(), a.clone()))
+                .collect::<Vec<_>>(),
+            TransferKind::Move,
+            &cancelled,
+        );
+        assert!(done.is_empty() && folder.exists());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

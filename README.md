@@ -12,7 +12,7 @@ Based on **[Shuffle by WizenPainter / Jaime Guzman](https://github.com/WizenPain
 | --- | --- |
 | Interface | Simplified Chinese by default; live Chinese/English switching with a saved preference. Translates menus, settings, common actions, file types, and tag colors. Some secondary UI strings still need review. |
 | Chinese names | Single-file/folder inline rename uses native macOS text input with composition and UTF-16 range handling for Chinese and emoji. New items enter this rename field. |
-| Copy and move | Finder-style shortcuts and system file clipboard integration. Copy/paste supports multiple items and folders; moves do not overwrite existing destinations and report conflicts. |
+| Copy and move | Finder-style shortcuts and system file clipboard integration. ⌘X/⌘V cuts and moves local selections; Copy/paste supports multiple items and folders; moves do not overwrite existing destinations and report conflicts. |
 | Archive extraction | ZIP and TAR variants extract into a separate sibling folder. Destination names avoid collisions; errors are shown and successful extraction can be undone. Available from the context menu, archive double-click, and a shortcut. |
 | Tags menu | Root and submenu are measured separately. Opening a submenu keeps the root stationary; the submenu opens left when the right edge has insufficient space and avoids the bottom edge independently. This fixes the layout cycle that caused hover flicker. |
 | Quick Look | Uses the native macOS panel. A single selection browses the displayed directory order; multiple selections browse only the chosen items. Up/Down navigate, Left/Right use native panel navigation, Space/Esc close, and browser focus follows. |
@@ -71,7 +71,8 @@ See [PERFORMANCE.md](PERFORMANCE.md) for measurement conditions and results.
 | Action | Shortcut |
 | --- | --- |
 | Copy selected files | ⌘C |
-| Paste into current folder | ⌘V |
+| Cut selected files/folders | ⌘X |
+| Paste into current folder (move after Cut) | ⌘V |
 | Move copied files here | ⌥⌘V |
 | New folder | ⇧⌘N |
 | Rename selection | Return |
@@ -93,6 +94,8 @@ Bindings can be changed in **Settings → Keybinds**. Existing explicitly cleare
 
 D keeps the final item name; F removes it. For `/data/project/report.pdf`, D copies the full path and F copies `/data/project`. For a selected folder `/data/project`, D copies that folder and F copies `/data`. Multiple selections are sorted by path, one per line; F deduplicates parent directories. Without a selection, both copy the browsing directory. T uses the active pane's browsing directory, or the active column in Column view, regardless of selected folders. This version opens the system Terminal for local directories only; remote tabs can copy remote paths.
 
+⌘X marks local files/folders for a move; ⌘V completes it in the browsing directory, including the active column. Sources remain intact until pasted. Multi-selection, progress, cancellation, and ⌘Z undo use the existing transfer engine. Existing destination names are skipped without overwriting; failed/skipped items remain pending for another destination. Successful items are removed from the cut batch, and repeated pastes are blocked while it is moving. Copying again (including in another app) cancels the old cut intent. Cut intent lasts only within the running Shuffle Flow process: pasting in Finder or restarting Shuffle Flow uses normal copy semantics. Remote cutting is not supported.
+
 Saved custom bindings and explicit clears are preserved; new defaults do not take over saved bindings. If an older configuration has Copy Path unbound, assign ⌘⇧D individually. Resetting defaults also resets other custom bindings. Reassigning an occupied combination in Settings clears the previous action within the same input context.
 
 ## Core source layout
@@ -100,6 +103,7 @@ Saved custom bindings and explicit clears are preserved; new defaults do not tak
 | File | Role |
 | --- | --- |
 | `src/main.rs` | File browser, file operations, shortcuts, native menus, and settings inherited from upstream and modified here. |
+| `src/file_clipboard.rs` | Cut batch revisions, duplicate-paste protection, and partial-success retention. |
 | `src/path_actions.rs` | Full/parent path handling, active-column directory selection, and literal terminal arguments. |
 | `src/i18n.rs` | UI translation catalog and persisted language selection. |
 | `src/ime.rs` | Inline rename's native text-input handler and Unicode/composition range conversion. |
@@ -114,7 +118,7 @@ Saved custom bindings and explicit clears are preserved; new defaults do not tak
 
 Before this sync, both the local-build and upstream-compatible configurations passed **17 tests** covering composition/range handling, Unicode Finder file URLs, Chinese filenames, copy/move conflicts, archive extraction, shortcuts, and menu placement. The release build and bundle signature checks passed.
 
-The current version passes all **27 tests** with `cargo test --locked` and the default Shuffle Flow features. New coverage includes preview navigation boundaries, cache retention/eviction and immediate budget reduction, ranking equivalence, legacy preference migration, and saved performance/SSH settings. Path coverage includes Chinese/emoji names, deduplicated parents, root/empty-selection behavior, active-column paths, literal terminal arguments, and binding migration/conflicts.
+The current version passes all **30 tests** with `cargo test --locked` and the default Shuffle Flow features. New coverage includes preview navigation boundaries, cache retention/eviction and immediate budget reduction, ranking equivalence, legacy preference migration, and saved performance/SSH settings. Cut tests cover clipboard replacement, duplicate-paste protection, partial failures, Unicode folders, preserved conflicts, cancellation, and move reversal. Path coverage includes Chinese/emoji names, deduplicated parents, root/empty-selection behavior, active-column paths, literal terminal arguments, and binding migration/conflicts.
 
 Actual-window checks confirmed the Shuffle Flow menu name, left-opening/bottom-clamped tag submenu without moving the root, ⇧⌘N folder creation, and saving a pasted Chinese/emoji folder name. Native Quick Look was also checked across three Chinese-named text files: Down/Right/Up navigation, updated content, and Space to close. Column-view navigation was checked inside a child directory too. Native panel presentation is deferred outside GPUI updates to avoid reentrant App borrows while preview generators load. The performance/SSH controls were checked in the actual settings window, including persistence after restart. Pinyin candidate-window interaction has not yet been manually verified.
 
@@ -131,5 +135,3 @@ These items are plans, not completed features. Bug reports are welcome through [
 ## License
 
 [MIT](LICENSE). Original work © 2026 **Jaime Guzman**; Shuffle Flow modifications © 2026 **elyann368**. See [ATTRIBUTION.md](ATTRIBUTION.md) for the upstream baseline and asset/dependency credits.
-
-The new D/F shortcuts were checked in the actual window with a Chinese/emoji filename, including pasting the resulting text into the address bar; the right-click hints were also verified. Terminal command construction is tested, but its opened working directory has not been manually verified because the UI automation tool blocks access to Terminal.
